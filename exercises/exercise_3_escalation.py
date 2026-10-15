@@ -1,6 +1,6 @@
 """Exercise 3 — Escalation branch with reviewer Q&A.
 
-When confidence < 60%, the agent doesn't ask approve/reject — it asks specific
+When confidence is below ESCALATE_THRESHOLD, the agent doesn't ask approve/reject — it asks specific
 clarifying questions and then synthesizes a refined review from the answers.
 """
 
@@ -34,21 +34,78 @@ def node_fetch_pr(state):
     with console.status("[dim]Fetching PR from GitHub...[/dim]"):
         pr = fetch_pr(state["pr_url"])
     console.print(f"  [green]✓[/green] {len(pr.files_changed)} files, head {pr.head_sha[:7]}")
-    return {"pr_title": pr.title, "pr_diff": pr.diff, "pr_files": pr.files_changed, "pr_head_sha": pr.head_sha}
+    return {"pr_title": pr.title, "pr_diff": pr.diff, "pr_files": pr.files_changed, "pr_head_sha": pr.head_sha, "pr_author": pr.author}
+
+
+ANALYZE_SYSTEM_PROMPT = """You are a senior code reviewer triaging a pull request for a human-in-the-loop review system. Produce a structured review of the diff.
+
+`confidence` (0.0-1.0) means: how sure you are that your review is complete and correct AND that the PR can be merged without asking the author anything. It is NOT a score of how nice the code is. Be conservative: when unsure, choose the LOWER band.
+
+Work in this order: (1) risk_factors, (2) comments, (3) confidence, (4) confidence_reasoning, which must name the band and every risk factor that lowered the score.
+
+Calibration bands (use the full range; never default to 0.60):
+- 0.85-0.95: purely mechanical change (typo, docs, comment, dependency bump, one-line rename/refactor). No behaviour, schema, auth or security impact.
+- 0.73-0.84: small, self-contained, tested behaviour change with no open question.
+- 0.58-0.72: small feature or data-model/schema change that is probably fine but needs human eyes (edge cases, migration or backward-compatibility question, thin tests). If a migration/existing-data question is unanswered, stay at or below 0.70. A small, focused change whose only concerns are an open migration question and thin tests, with no security red flag, belongs in this band: do not score it below 0.58 for those reasons alone.
+- 0.20-0.57: high risk. Touches authentication, passwords, crypto, tokens or secrets, SQL or user-input handling, network/cloud sync, or migrations; contains a security flaw; adds substantial new code without tests; or the intent is unclear.
+
+Security red flags: weak or unsalted password hashing (MD5, SHA1), secrets or tokens stored in plaintext, SQL built with string formatting or concatenation (injection), hard-coded credentials or user ids, plain HTTP for sensitive traffic, disabled TLS verification. One serious red flag caps confidence at 0.55. Two or more cap it at 0.45. New behaviour with no tests lowers the score within its band.
+
+Only report problems you can point to in the diff; give file and line in each comment and use severity blocker/issue/suggestion/nit honestly.
+
+escalation_questions: if confidence < 0.58, give 2-4 specific questions that reference a file or section of the diff and ask about intent, threat model or production configuration (for example why a given algorithm was chosen, or whether a URL is HTTPS in production). Otherwise return an empty list."""
+
+MAX_DIFF_CHARS = 60_000
+
+
+def _analyze_messages(state) -> list[dict]:
+    diff = state["pr_diff"]
+    if len(diff) > MAX_DIFF_CHARS:
+        diff = diff[:MAX_DIFF_CHARS] + "\n... [diff truncated] ..."
+    author = state.get("pr_author") or "unknown"
+    files = ", ".join(state.get("pr_files") or [])
+    return [
+        {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"Title: {state['pr_title']}\nAuthor: {author}\nChanged files: {files}\n\nDiff:\n{diff}"
+        )},
+    ]
+
+
+SYNTHESIZE_SYSTEM_PROMPT = """You are a senior code reviewer refining an earlier review of a pull request using the human reviewer's answers to your escalation questions.
+
+- Keep every issue the answers confirm (as comments with honest severity).
+- Drop or downgrade issues the answers genuinely resolve.
+- Add new comments the answers reveal.
+- Use the same calibration bands as the initial review: 0.85-0.95 purely mechanical; 0.73-0.84 small, self-contained, tested change; 0.58-0.72 probably fine but needs human eyes; 0.20-0.57 high risk (auth, crypto, secrets, SQL/user input, migrations, security flaws, untested new code, unclear intent).
+- Raise `confidence` only where the answers resolve uncertainty. It should usually end higher than the initial value, but stay below 0.85 while any blocker remains.
+- Give file and line in each comment. Return `escalation_questions=[]`."""
+
+
+def _synthesize_messages(state, qa: str) -> list[dict]:
+    a = state["analysis"]
+    diff = state["pr_diff"]
+    if len(diff) > MAX_DIFF_CHARS:
+        diff = diff[:MAX_DIFF_CHARS] + "\n... [diff truncated] ..."
+    return [
+        {"role": "system", "content": SYNTHESIZE_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"Title: {state['pr_title']}\n\nDiff:\n{diff}\n\n"
+            f"Initial analysis:\nSummary: {a.summary}\n"
+            f"Risk factors: {a.risk_factors}\n"
+            f"Comments: {[c.model_dump() for c in a.comments]}\n"
+            f"Confidence: {a.confidence}\nConfidence reasoning: {a.confidence_reasoning}\n\n"
+            f"Reviewer Q&A:\n{qa}"
+        )},
+    ]
+
 
 
 def node_analyze(state):
     console.print("[cyan]→ analyze[/cyan]")
-    llm = get_llm().with_structured_output(PRAnalysis)
+    llm = get_llm(temperature=0).with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
-        analysis = llm.invoke([
-            {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
-            )},
-            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
-        ])
+        analysis = llm.invoke(_analyze_messages(state))
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.escalation_questions)} question(s)")
     return {"analysis": analysis}
 
@@ -71,22 +128,28 @@ def node_escalate(state: ReviewState) -> dict:
         # fallback when the LLM didn't generate any questions
         questions = ["What is the intent of this PR?", "Any migration concerns?"]
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    })
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    console.print("[cyan]→ synthesize[/cyan]")
+    a = state["analysis"]
+    qa = "\n".join(f"Q: {q}\nA: {ans}" for q, ans in (state.get("escalation_answers") or {}).items())
+    llm = get_llm(temperature=0).with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM refining review with reviewer answers...[/dim]"):
+        refined = llm.invoke(_synthesize_messages(state, qa))
+    console.print(f"  [green]✓[/green] refined confidence={refined.confidence:.0%}")
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -161,7 +224,8 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 
